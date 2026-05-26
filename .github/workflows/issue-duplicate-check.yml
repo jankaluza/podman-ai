@@ -1,0 +1,119 @@
+# On new issue: incremental sync from DB watermark → refresh target issue → duplicate check → comment.
+# Manual run: workflow_dispatch with issue_number (and optional owner/repo).
+
+name: Check issue duplicate
+
+on:
+  issues:
+    types: [opened]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to check"
+        required: true
+        type: number
+      owner:
+        description: "GitHub owner (org or user)"
+        default: containers
+        type: string
+      repo:
+        description: "Repository name"
+        default: podman
+        type: string
+
+jobs:
+  duplicate-check:
+    runs-on: ubuntu-latest
+    # One sync+check at a time per repo (avoids watermark races on github_sync_state).
+    concurrency:
+      group: duplicate-check-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      issues: write
+      contents: read
+    env:
+      OWNER: ${{ github.event_name == 'issues' && github.repository_owner || inputs.owner }}
+      REPO: ${{ github.event_name == 'issues' && github.event.repository.name || inputs.repo }}
+      ISSUE_NUMBER: ${{ github.event_name == 'issues' && github.event.issue.number || inputs.issue_number }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.DEDUP_TOOLING_REPO || github.repository }}
+          path: ${{ vars.DEDUP_TOOLING_REPO && 'tooling' || '.' }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r ${{ vars.DEDUP_TOOLING_REPO && 'tooling/' || '' }}requirements-sync.txt
+
+      - name: Sync GitHub issues (incremental, watermark from Supabase)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          ROOT="${{ vars.DEDUP_TOOLING_REPO && 'tooling' || '.' }}"
+          python "${ROOT}/scripts/sync_github_issues.py" \
+            --owner "$OWNER" --repo "$REPO"
+
+      - name: Sync target issue
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          ROOT="${{ vars.DEDUP_TOOLING_REPO && 'tooling' || '.' }}"
+          python "${ROOT}/scripts/sync_github_issues.py" \
+            --owner "$OWNER" --repo "$REPO" --issue "$ISSUE_NUMBER"
+
+      - name: Call Supabase duplicate check
+        id: check
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          DEDUP_FUNCTION_SECRET: ${{ secrets.DEDUP_FUNCTION_SECRET }}
+        run: |
+          RESP=$(curl -sf -X POST "${SUPABASE_URL}/functions/v1/check-duplicate" \
+            -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
+            -H "Content-Type: application/json" \
+            -H "x-dedup-secret: ${DEDUP_FUNCTION_SECRET}" \
+            -d "{\"owner\":\"${OWNER}\",\"repo\":\"${REPO}\",\"issue_number\":${ISSUE_NUMBER}}")
+          echo "$RESP" | tee check-response.json
+          DUP=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('duplicate_issue_id') or '')")
+          REASON=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('reason',''))")
+          URL=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('duplicate_url') or '')")
+          echo "duplicate_id=$DUP" >> "$GITHUB_OUTPUT"
+          echo "reason<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$REASON" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "duplicate_url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Comment on issue when duplicate suspected
+        if: github.event_name == 'issues' && steps.check.outputs.duplicate_id != ''
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const dup = '${{ steps.check.outputs.duplicate_id }}';
+            const reason = `${{ steps.check.outputs.reason }}`;
+            const url = '${{ steps.check.outputs.duplicate_url }}';
+            const link = url || `https://github.com/${context.repo.owner}/${context.repo.repo}/issues/${dup}`;
+            const body = [
+              '### Possible duplicate issue',
+              '',
+              `This issue may be a duplicate of **#${dup}** (${link}).`,
+              '',
+              '**Why:** ' + reason,
+              '',
+              'If this is not a duplicate, please say so. This note was generated automatically (Gemini + issue index).',
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });

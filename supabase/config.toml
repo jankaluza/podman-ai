@@ -1,0 +1,4 @@
+# https://supabase.com/docs/guides/cli/config
+
+[functions.check-duplicate]
+verify_jwt = false
