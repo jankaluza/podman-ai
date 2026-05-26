@@ -76,6 +76,15 @@ On **`issues.opened`** (or manual **workflow_dispatch**):
 
 **In containers/podman:** copy the workflow file and set repository variable `DEDUP_TOOLING_REPO` to `your-org/duplicate` so Actions checks out this tooling repo into `tooling/`.
 
+**On a fork (e.g. `your-user/podman-ai`):** set repository variables so sync and Supabase still target upstream:
+
+| Variable | Example | Purpose |
+|----------|---------|---------|
+| `DEDUP_OWNER` | `containers` | GitHub owner for sync + duplicate index |
+| `DEDUP_REPO` | `podman` | GitHub repo name for sync + duplicate index |
+
+Comments are still posted on the **fork** issue that triggered the workflow. Sync/`--issue` fetch issue data from **`DEDUP_OWNER`/`DEDUP_REPO`** using the fork’s issue number (same numbering as upstream only if issues align).
+
 **Parallel runs:** The workflow uses a [concurrency group](https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#concurrency) per repository (`duplicate-check-<owner>/<repo>`), so two issues opened at once are processed **one after another**, not in parallel. Issue upserts are idempotent; the sync script also never lowers `last_github_updated_at` if jobs did overlap. Duplicate checks for different issues do not share state beyond the shared issue index.
 
 ### 4. Candidate selection
