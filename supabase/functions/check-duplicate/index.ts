@@ -5,6 +5,8 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
 const GEMINI_MODEL = "gemini-2.5-flash-lite";
 const CANDIDATE_LIMIT = 50;
 const MAX_GEMINI_CANDIDATES = 25;
+/** Cap full-table scan pages (1000 rows each) to avoid Edge Function timeouts. */
+const MAX_FULL_SCAN_PAGES = 8;
 const EXACT_TITLE_SIMILARITY = 0.92;
 const MIN_TITLE_FOR_REVIEW = 0.22;
 
@@ -187,12 +189,15 @@ async function fetchAllIssuesScored(
   owner: string,
   repo: string,
   excludeSameIssueNumber: boolean,
+  maxPages: number = MAX_FULL_SCAN_PAGES,
 ): Promise<ScoredCandidate[]> {
   const pageSize = 1000;
   const pool: GithubIssue[] = [];
   let from = 0;
+  let page = 0;
 
-  while (true) {
+  while (page < maxPages) {
+    page++;
     let q = sb
       .from("github_issues")
       .select("issue_number, title, body, state, labels, html_url, github_updated_at")
@@ -237,6 +242,13 @@ async function fetchScoredCandidates(
   const exact = await fetchExactTitleMatches(sb, target, owner, repo, excludeSame);
 
   if (!targetFromDb) {
+    if (exact.length > 0) {
+      return {
+        rows: mergeCandidates(target, [exact], false).slice(0, CANDIDATE_LIMIT),
+        method: "exact_title",
+        rpc_error: null,
+      };
+    }
     const scanned = await fetchAllIssuesScored(sb, target, owner, repo, false);
     const merged = mergeCandidates(target, [exact, scanned], false);
     return { rows: merged.slice(0, CANDIDATE_LIMIT), method: "exact_title+full_scan", rpc_error: null };

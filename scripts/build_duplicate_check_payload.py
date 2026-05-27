@@ -34,9 +34,12 @@ def main() -> int:
         headers["Authorization"] = f"Bearer {token}"
 
     url = f"{GITHUB_API}/repos/{gh_owner}/{gh_repo}/issues/{args.issue_number}"
+    print(f"GET {url}", file=sys.stderr)
     with httpx.Client(timeout=60.0) as client:
         r = client.get(url, headers=headers)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            print(f"GitHub API error {r.status_code}: {r.text[:500]}", file=sys.stderr)
+            r.raise_for_status()
         raw = r.json()
 
     if raw.get("pull_request"):
@@ -56,6 +59,8 @@ def main() -> int:
             "html_url": raw.get("html_url"),
         },
     }
+    title_preview = (payload["target"]["title"] or "")[:60]
+    print(f"Built inline target for #{args.issue_number}: {title_preview!r}", file=sys.stderr)
     json.dump(payload, sys.stdout)
     return 0
 

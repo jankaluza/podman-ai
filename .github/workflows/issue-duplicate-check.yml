@@ -71,19 +71,34 @@ jobs:
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
           DEDUP_FUNCTION_SECRET: ${{ secrets.DEDUP_FUNCTION_SECRET }}
         run: |
+          set -euo pipefail
           ROOT="${{ vars.DEDUP_TOOLING_REPO && 'tooling' || '.' }}"
-          PAYLOAD=$(python3 "${ROOT}/scripts/build_duplicate_check_payload.py" \
+          BASE_URL="${SUPABASE_URL%/}"
+
+          python3 "${ROOT}/scripts/build_duplicate_check_payload.py" \
             --owner containers --repo podman --issue-number "$ISSUE_NUMBER" \
-            --github-owner "$GITHUB_OWNER" --github-repo "$GITHUB_REPO")
-          RESP=$(curl -sf -X POST "${SUPABASE_URL}/functions/v1/check-duplicate" \
+            --github-owner "$GITHUB_OWNER" --github-repo "$GITHUB_REPO" \
+            > payload.json
+          echo "Payload: $(wc -c < payload.json) bytes (fork issue → inline target)"
+          python3 -c "import json; p=json.load(open('payload.json')); assert p.get('target',{}).get('title'), 'payload missing target.title — deploy latest check-duplicate'"
+
+          HTTP_CODE=$(curl -sS -o check-response.json -w '%{http_code}' \
+            -X POST "${BASE_URL}/functions/v1/check-duplicate" \
             -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
             -H "Content-Type: application/json" \
             -H "x-dedup-secret: ${DEDUP_FUNCTION_SECRET}" \
-            -d "$PAYLOAD")
-          echo "$RESP" | tee check-response.json
-          DUP=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('duplicate_issue_id') or '')")
-          REASON=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('reason',''))")
-          URL=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('duplicate_url') or '')")
+            -d @payload.json)
+          echo "check-duplicate HTTP ${HTTP_CODE}"
+          cat check-response.json
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::error::check-duplicate returned HTTP ${HTTP_CODE}. If 404, redeploy: supabase functions deploy check-duplicate"
+            exit 1
+          fi
+
+          DUP=$(python3 -c "import json; d=json.load(open('check-response.json')); print(d.get('duplicate_issue_id') or '')")
+          REASON=$(python3 -c "import json; d=json.load(open('check-response.json')); print(d.get('reason',''))")
+          URL=$(python3 -c "import json; d=json.load(open('check-response.json')); print(d.get('duplicate_url') or '')")
           echo "duplicate_id=$DUP" >> "$GITHUB_OUTPUT"
           echo "reason<<EOF" >> "$GITHUB_OUTPUT"
           echo "$REASON" >> "$GITHUB_OUTPUT"
