@@ -35,16 +35,19 @@ jobs:
       issues: write
       contents: read
     env:
-      # Upstream index: sync, Supabase, duplicate API (override via repo variables DEDUP_OWNER / DEDUP_REPO)
+      # Upstream index: sync, Supabase, duplicate API (override via DEDUP_OWNER / DEDUP_REPO)
       OWNER: ${{ vars.DEDUP_OWNER || (github.event_name == 'workflow_dispatch' && inputs.owner || github.repository_owner) }}
       REPO: ${{ vars.DEDUP_REPO || (github.event_name == 'workflow_dispatch' && inputs.repo || github.event.repository.name) }}
+      # Where to read the opened issue from GitHub API (fork), when different from index
+      GITHUB_OWNER: ${{ github.event_name == 'issues' && github.repository_owner || vars.DEDUP_OWNER || (github.event_name == 'workflow_dispatch' && inputs.owner || github.repository_owner) }}
+      GITHUB_REPO: ${{ github.event_name == 'issues' && github.event.repository.name || vars.DEDUP_REPO || (github.event_name == 'workflow_dispatch' && inputs.repo || github.event.repository.name) }}
       ISSUE_NUMBER: ${{ github.event_name == 'issues' && github.event.issue.number || inputs.issue_number }}
     steps:
       - name: Log configuration
         run: |
           echo "Upstream index (sync + Supabase): ${OWNER}/${REPO}"
+          echo "Fetch target issue from:          ${GITHUB_OWNER}/${GITHUB_REPO}#${ISSUE_NUMBER}"
           echo "Workflow repository (comments):   ${GITHUB_REPOSITORY}"
-          echo "Issue number:                     ${ISSUE_NUMBER}"
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -78,7 +81,9 @@ jobs:
         run: |
           ROOT="${{ vars.DEDUP_TOOLING_REPO && 'tooling' || '.' }}"
           python "${ROOT}/scripts/sync_github_issues.py" \
-            --owner "$OWNER" --repo "$REPO" --issue "$ISSUE_NUMBER"
+            --owner "$OWNER" --repo "$REPO" \
+            --github-owner "$GITHUB_OWNER" --github-repo "$GITHUB_REPO" \
+            --issue "$ISSUE_NUMBER"
 
       - name: Call Supabase duplicate check
         id: check

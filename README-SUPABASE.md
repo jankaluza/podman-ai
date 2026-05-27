@@ -83,7 +83,9 @@ On **`issues.opened`** (or manual **workflow_dispatch**):
 | `DEDUP_OWNER` | `containers` | GitHub owner for sync + duplicate index |
 | `DEDUP_REPO` | `podman` | GitHub repo name for sync + duplicate index |
 
-Comments are still posted on the **fork** issue that triggered the workflow. Sync/`--issue` fetch issue data from **`DEDUP_OWNER`/`DEDUP_REPO`** using the fork’s issue number (same numbering as upstream only if issues align).
+Comments are still posted on the **fork** issue that triggered the workflow.
+
+**Important:** incremental sync uses **`DEDUP_OWNER`/`DEDUP_REPO`** (e.g. `containers/podman`). The target issue is **fetched from the fork** (`GITHUB_OWNER`/`GITHUB_REPO` from the `issues.opened` event) and stored in Supabase under the upstream index keys so duplicate detection compares your fork issue against the upstream issue database.
 
 **Parallel runs:** The workflow uses a [concurrency group](https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#concurrency) per repository (`duplicate-check-<owner>/<repo>`), so two issues opened at once are processed **one after another**, not in parallel. Issue upserts are idempotent; the sync script also never lowers `last_github_updated_at` if jobs did overlap. Duplicate checks for different issues do not share state beyond the shared issue index.
 

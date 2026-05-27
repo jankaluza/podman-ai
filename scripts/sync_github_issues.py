@@ -186,11 +186,15 @@ def fetch_single_issue(
     *,
     token: str | None,
 ) -> dict[str, Any]:
+    """Fetch one issue/PR from GitHub Issues API (owner/repo = where to read from)."""
     url = f"{GITHUB_API}/repos/{owner}/{repo}/issues/{issue_number}"
     r = github_get(client, url, params=None, token=token)
     data = r.json()
     if data.get("pull_request") is not None:
-        raise ValueError(f"#{issue_number} is a pull request, not an issue")
+        raise ValueError(
+            f"{owner}/{repo}#{issue_number} is a pull request on GitHub, not an issue "
+            f"(check --github-owner/--github-repo if using a fork)"
+        )
     return data
 
 
@@ -472,6 +476,16 @@ def main() -> int:
         metavar="N",
         help="Sync only this issue number (one GitHub API request)",
     )
+    p.add_argument(
+        "--github-owner",
+        metavar="ORG",
+        help="GitHub org/user to fetch --issue from (default: --owner). Use fork when index is upstream.",
+    )
+    p.add_argument(
+        "--github-repo",
+        metavar="NAME",
+        help="GitHub repo to fetch --issue from (default: --repo). Use fork when index is upstream.",
+    )
     args = p.parse_args()
 
     started = time.monotonic()
@@ -502,10 +516,14 @@ def main() -> int:
 
     with httpx.Client(timeout=90.0) as client:
         if args.issue is not None:
+            gh_owner = args.github_owner or args.owner
+            gh_repo = args.github_repo or args.repo
             log(f"Mode: single issue #{args.issue}")
-            log(f"GET /repos/{args.owner}/{args.repo}/issues/{args.issue}")
+            log(f"GET /repos/{gh_owner}/{gh_repo}/issues/{args.issue}")
+            if gh_owner != args.owner or gh_repo != args.repo:
+                log(f"Upsert into Supabase index as {args.owner}/{args.repo}")
             raw_issues = [
-                fetch_single_issue(client, args.owner, args.repo, args.issue, token=token)
+                fetch_single_issue(client, gh_owner, gh_repo, args.issue, token=token)
             ]
             title = (raw_issues[0].get("title") or "")[:80]
             log(f"Fetched: #{args.issue} [{raw_issues[0].get('state')}] {title!r}")
