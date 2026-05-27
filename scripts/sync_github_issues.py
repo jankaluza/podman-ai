@@ -479,12 +479,12 @@ def main() -> int:
     p.add_argument(
         "--github-owner",
         metavar="ORG",
-        help="GitHub org/user to fetch --issue from (default: --owner). Use fork when index is upstream.",
+        help="Must match --owner (fork issues are not stored in Supabase).",
     )
     p.add_argument(
         "--github-repo",
         metavar="NAME",
-        help="GitHub repo to fetch --issue from (default: --repo). Use fork when index is upstream.",
+        help="Must match --repo (fork issues are not stored in Supabase).",
     )
     args = p.parse_args()
 
@@ -518,10 +518,15 @@ def main() -> int:
         if args.issue is not None:
             gh_owner = args.github_owner or args.owner
             gh_repo = args.github_repo or args.repo
+            if gh_owner != args.owner or gh_repo != args.repo:
+                log(
+                    "Error: refusing to store a fork issue in the upstream index. "
+                    "Sync only writes to --owner/--repo on GitHub. "
+                    "For fork issues, pass title/body via check-duplicate target (see build_duplicate_check_payload.py)."
+                )
+                return 1
             log(f"Mode: single issue #{args.issue}")
             log(f"GET /repos/{gh_owner}/{gh_repo}/issues/{args.issue}")
-            if gh_owner != args.owner or gh_repo != args.repo:
-                log(f"Upsert into Supabase index as {args.owner}/{args.repo}")
             raw_issues = [
                 fetch_single_issue(client, gh_owner, gh_repo, args.issue, token=token)
             ]

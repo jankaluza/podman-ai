@@ -1,8 +1,7 @@
-# On new issue: incremental sync from DB watermark → refresh target issue → duplicate check → comment.
-# Manual run: workflow_dispatch with issue_number (and optional owner/repo).
+# On new issue: sync containers/podman → check opened issue (fork or upstream) → comment.
 #
-# Fork support: set repository variables DEDUP_OWNER / DEDUP_REPO (e.g. containers / podman)
-# so sync + Supabase use upstream while comments still post on the fork issue that triggered the run.
+# Sync always uses containers/podman (never the fork). The issue under test is read from
+# the repository that triggered the workflow and sent inline to check-duplicate.
 
 name: Check issue duplicate
 
@@ -12,42 +11,33 @@ on:
   workflow_dispatch:
     inputs:
       issue_number:
-        description: "Issue number to check"
+        description: "Issue number to check (in this repository)"
         required: true
         type: number
-      owner:
-        description: "Upstream owner for sync/DB (used if DEDUP_OWNER var unset)"
-        default: containers
-        type: string
-      repo:
-        description: "Upstream repo for sync/DB (used if DEDUP_REPO var unset)"
-        default: podman
-        type: string
 
 jobs:
   duplicate-check:
     runs-on: ubuntu-latest
-    # Serialize per upstream index (owner/repo used for Supabase), not per fork name.
     concurrency:
-      group: duplicate-check-${{ vars.DEDUP_OWNER || (github.event_name == 'workflow_dispatch' && inputs.owner || github.repository_owner) }}-${{ vars.DEDUP_REPO || (github.event_name == 'workflow_dispatch' && inputs.repo || github.event.repository.name) }}
+      group: duplicate-check-containers-podman
       cancel-in-progress: false
     permissions:
       issues: write
       contents: read
     env:
-      # Upstream index: sync, Supabase, duplicate API (override via DEDUP_OWNER / DEDUP_REPO)
-      OWNER: ${{ vars.DEDUP_OWNER || (github.event_name == 'workflow_dispatch' && inputs.owner || github.repository_owner) }}
-      REPO: ${{ vars.DEDUP_REPO || (github.event_name == 'workflow_dispatch' && inputs.repo || github.event.repository.name) }}
-      # Where to read the opened issue from GitHub API (fork), when different from index
-      GITHUB_OWNER: ${{ github.event_name == 'issues' && github.repository_owner || vars.DEDUP_OWNER || (github.event_name == 'workflow_dispatch' && inputs.owner || github.repository_owner) }}
-      GITHUB_REPO: ${{ github.event_name == 'issues' && github.event.repository.name || vars.DEDUP_REPO || (github.event_name == 'workflow_dispatch' && inputs.repo || github.event.repository.name) }}
+      # Duplicate index + GitHub sync (fixed upstream; never the fork)
+      INDEX_OWNER: containers
+      INDEX_REPO: podman
+      # Issue to check: repository where this workflow runs (fork on issues.opened)
+      GITHUB_OWNER: ${{ github.repository_owner }}
+      GITHUB_REPO: ${{ github.event.repository.name }}
       ISSUE_NUMBER: ${{ github.event_name == 'issues' && github.event.issue.number || inputs.issue_number }}
     steps:
       - name: Log configuration
         run: |
-          echo "Upstream index (sync + Supabase): ${OWNER}/${REPO}"
-          echo "Fetch target issue from:          ${GITHUB_OWNER}/${GITHUB_REPO}#${ISSUE_NUMBER}"
-          echo "Workflow repository (comments):   ${GITHUB_REPOSITORY}"
+          echo "Sync + duplicate index (always): ${INDEX_OWNER}/${INDEX_REPO}"
+          echo "Issue to check:                  ${GITHUB_OWNER}/${GITHUB_REPO}#${ISSUE_NUMBER}"
+          echo "Workflow repository (comments):  ${GITHUB_REPOSITORY}"
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -63,7 +53,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r ${{ vars.DEDUP_TOOLING_REPO && 'tooling/' || '' }}requirements-sync.txt
 
-      - name: Sync GitHub issues (incremental, watermark from Supabase)
+      - name: Sync GitHub issues to Supabase (containers/podman only)
         env:
           GITHUB_TOKEN: ${{ secrets.SUPABASE_GITHUB_TOKEN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -71,32 +61,25 @@ jobs:
         run: |
           ROOT="${{ vars.DEDUP_TOOLING_REPO && 'tooling' || '.' }}"
           python "${ROOT}/scripts/sync_github_issues.py" \
-            --owner "$OWNER" --repo "$REPO"
-
-      - name: Sync target issue
-        env:
-          GITHUB_TOKEN: ${{ secrets.SUPABASE_GITHUB_TOKEN }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: |
-          ROOT="${{ vars.DEDUP_TOOLING_REPO && 'tooling' || '.' }}"
-          python "${ROOT}/scripts/sync_github_issues.py" \
-            --owner "$OWNER" --repo "$REPO" \
-            --github-owner "$GITHUB_OWNER" --github-repo "$GITHUB_REPO" \
-            --issue "$ISSUE_NUMBER"
+            --owner containers --repo podman
 
       - name: Call Supabase duplicate check
         id: check
         env:
+          GITHUB_TOKEN: ${{ secrets.SUPABASE_GITHUB_TOKEN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
           DEDUP_FUNCTION_SECRET: ${{ secrets.DEDUP_FUNCTION_SECRET }}
         run: |
+          ROOT="${{ vars.DEDUP_TOOLING_REPO && 'tooling' || '.' }}"
+          PAYLOAD=$(python3 "${ROOT}/scripts/build_duplicate_check_payload.py" \
+            --owner containers --repo podman --issue-number "$ISSUE_NUMBER" \
+            --github-owner "$GITHUB_OWNER" --github-repo "$GITHUB_REPO")
           RESP=$(curl -sf -X POST "${SUPABASE_URL}/functions/v1/check-duplicate" \
             -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
             -H "Content-Type: application/json" \
             -H "x-dedup-secret: ${DEDUP_FUNCTION_SECRET}" \
-            -d "{\"owner\":\"${OWNER}\",\"repo\":\"${REPO}\",\"issue_number\":${ISSUE_NUMBER}}")
+            -d "$PAYLOAD")
           echo "$RESP" | tee check-response.json
           DUP=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('duplicate_issue_id') or '')")
           REASON=$(echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('reason',''))")
@@ -110,22 +93,17 @@ jobs:
       - name: Comment on issue when duplicate suspected
         if: github.event_name == 'issues' && steps.check.outputs.duplicate_id != ''
         uses: actions/github-script@v7
-        env:
-          UPSTREAM_OWNER: ${{ env.OWNER }}
-          UPSTREAM_REPO: ${{ env.REPO }}
         with:
           github-token: ${{ secrets.SUPABASE_GITHUB_TOKEN }}
           script: |
             const dup = '${{ steps.check.outputs.duplicate_id }}';
             const reason = `${{ steps.check.outputs.reason }}`;
             const url = '${{ steps.check.outputs.duplicate_url }}';
-            const upstreamOwner = process.env.UPSTREAM_OWNER;
-            const upstreamRepo = process.env.UPSTREAM_REPO;
-            const link = url || `https://github.com/${upstreamOwner}/${upstreamRepo}/issues/${dup}`;
+            const link = url || `https://github.com/containers/podman/issues/${dup}`;
             const body = [
               '### Possible duplicate issue',
               '',
-              `This issue may be a duplicate of **#${dup}** on [${upstreamOwner}/${upstreamRepo}](${link}).`,
+              `This issue may be a duplicate of **#${dup}** on [containers/podman](${link}).`,
               '',
               '**Why:** ' + reason,
               '',

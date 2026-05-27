@@ -4,7 +4,7 @@ Pipeline for [containers/podman issues](https://github.com/containers/podman/iss
 
 1. **`scripts/sync_github_issues.py`** — sync issues into Supabase (full or incremental via GitHub `since=`).
 2. **`supabase/functions/check-duplicate`** — Edge Function calling **Gemini 2.5 Flash Lite**; returns `duplicate_issue_id` and `reason`.
-3. **GitHub Action** — on `issues.opened`, upserts the issue, calls the function, comments if a duplicate is found.
+3. **GitHub Action** — on `issues.opened`, syncs **upstream only**, passes the fork issue inline to the function, comments if a duplicate is found.
 
 ## Setup
 
@@ -49,7 +49,7 @@ First run fetches all issues (paginated, ~0.75s delay between pages). Re-runs re
 # Force full refresh
 python scripts/sync_github_issues.py --owner containers --repo podman --full
 
-# One issue (used by the GitHub Action on open)
+# One upstream issue only (must be on containers/podman — fork issues are not synced)
 python scripts/sync_github_issues.py --owner containers --repo podman --issue 28750
 ```
 
@@ -59,10 +59,9 @@ Workflow: [`.github/workflows/issue-duplicate-check.yml`](.github/workflows/issu
 
 On **`issues.opened`** (or manual **workflow_dispatch**):
 
-1. **Incremental sync** — `sync_github_issues.py` uses the Supabase DB watermark (`since=`)
-2. **Sync target issue** — `--issue <number>` so the new issue is up to date
-3. **`check-duplicate`** Edge Function
-4. **Comment** on the issue if a duplicate is found (skipped for manual runs)
+1. **Incremental sync** — `sync_github_issues.py` for **`containers/podman` only** (watermark `since=`)
+2. **`check-duplicate`** — fetches the opened issue from the fork via GitHub API (`target` in JSON; **not** written to Supabase)
+3. **Comment** on the fork issue if a duplicate is found (skipped for manual runs)
 
 | Secret | Purpose |
 |--------|---------|
@@ -76,22 +75,37 @@ On **`issues.opened`** (or manual **workflow_dispatch**):
 
 **In containers/podman:** copy the workflow file and set repository variable `DEDUP_TOOLING_REPO` to `your-org/duplicate` so Actions checks out this tooling repo into `tooling/`.
 
-**On a fork (e.g. `your-user/podman-ai`):** set repository variables so sync and Supabase still target upstream:
+**On a fork (e.g. `your-user/podman-ai`):** the workflow **always** syncs **`containers/podman`** (hardcoded). Fork issues are **never** written to Supabase. Your fork issue is fetched from GitHub and sent as `target` inline to `check-duplicate`. Comments are posted on the fork issue that triggered the run.
+
+Optional variable:
 
 | Variable | Example | Purpose |
 |----------|---------|---------|
-| `DEDUP_OWNER` | `containers` | GitHub owner for sync + duplicate index |
-| `DEDUP_REPO` | `podman` | GitHub repo name for sync + duplicate index |
+| `DEDUP_TOOLING_REPO` | `your-org/duplicate` | Checkout this repo for scripts when the workflow lives on a fork |
 
-Comments are still posted on the **fork** issue that triggered the workflow.
+**Clean up bad data:** if fork issues were previously synced (wrong owner/repo, or fork content under upstream issue numbers), remove them and re-sync upstream:
 
-**Important:** incremental sync uses **`DEDUP_OWNER`/`DEDUP_REPO`** (e.g. `containers/podman`). The target issue is **fetched from the fork** (`GITHUB_OWNER`/`GITHUB_REPO` from the `issues.opened` event) and stored in Supabase under the upstream index keys so duplicate detection compares your fork issue against the upstream issue database.
+```sql
+-- Remove any index that is not containers/podman
+delete from github_issues where owner <> 'containers' or repo <> 'podman';
+delete from github_sync_state where owner <> 'containers' or repo <> 'podman';
+
+-- If fork issues were upserted as containers/podman #N, refresh those rows:
+-- python scripts/sync_github_issues.py --owner containers --repo podman --full
+```
 
 **Parallel runs:** The workflow uses a [concurrency group](https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#concurrency) per repository (`duplicate-check-<owner>/<repo>`), so two issues opened at once are processed **one after another**, not in parallel. Issue upserts are idempotent; the sync script also never lowers `last_github_updated_at` if jobs did overlap. Duplicate checks for different issues do not share state beyond the shared issue index.
 
 ### 4. Candidate selection
 
-`check-duplicate` ranks candidates with `find_duplicate_candidates` (title-heavy `pg_trgm`, penalizes generic body-only matches), then filters by **distinctive title word overlap** (ignoring broad terms like `ipv6`, `network`, `podman`). Gemini runs only on survivors and must return **`confidence: high`** and **`same_failure_mode: true`** to report a duplicate—otherwise the API returns null (avoids related-topic false positives).
+`check-duplicate` ranks candidates with `find_duplicate_candidates` (title-heavy `pg_trgm`; **open and closed** issues in the DB). It filters by **distinctive title word overlap**, then Gemini must return **`confidence: high`** and **`same_failure_mode: true`** to report a duplicate.
+
+**Copy-paste duplicates:** the function looks up **exact title matches** in the DB and ranks by **title similarity** first (not long generic bodies). If `candidate_selection.method` is `in_memory`, the RPC failed — deploy migrations and check `rpc_error` in the JSON. **`#25812` must exist in Supabase** with the same title row: run `python scripts/sync_github_issues.py --owner containers --repo podman --full` once, or verify with:
+
+```sql
+select issue_number, state, title from github_issues
+where owner='containers' and repo='podman' and title like '%Strict Dependency Enforcement%';
+```
 
 Apply the migration and redeploy:
 
@@ -107,8 +121,10 @@ curl -X POST "$SUPABASE_URL/functions/v1/check-duplicate" \
   -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhicGF4aHh3YXVldnJuY2ppcGpuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkzNTA2MjMsImV4cCI6MjA5NDkyNjYyM30.yPC7dAOQX6Iab_W5fCorUxY06N8xdAqqottbXvyx6UU" \
   -H "Content-Type: application/json" \
   -H "x-dedup-secret: long_random_string" \
-  -d '{"owner":"containers","repo":"podman","issue_number":28750}'
+  -d '{"owner":"containers","repo":"podman","issue_number":6,"target":{"title":"...","body":"...","state":"open","labels":[]}}'
 ```
+
+Or use `scripts/build_duplicate_check_payload.py` to fetch from GitHub and print the JSON body.
 
 Example response:
 
@@ -128,7 +144,7 @@ Example response:
 
 - Sync uses **`per_page=100`**, sleeps **`PAGE_DELAY_SEC`** (default 0.75s) between pages, and honors **`X-RateLimit-Reset`** on 403.
 - Incremental sync typically needs **one or a few** API calls when few issues changed.
-- New-issue Action uses **one** `GET /issues/{n}` per opened issue.
+- New-issue Action uses **one** `GET /issues/{n}` on the fork for duplicate check (not stored in DB).
 
 ## Schema
 
