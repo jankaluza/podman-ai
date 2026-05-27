@@ -92,7 +92,7 @@ jobs:
           cat check-response.json
 
           if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-            echo "::error::check-duplicate returned HTTP ${HTTP_CODE}. If 404, redeploy: supabase functions deploy check-duplicate"
+            echo "::error::check-duplicate returned HTTP ${HTTP_CODE}. Run: supabase db push && supabase functions deploy check-duplicate"
             exit 1
           fi
 

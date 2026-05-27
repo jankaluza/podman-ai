@@ -3,10 +3,9 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
 
 const GEMINI_MODEL = "gemini-2.5-flash-lite";
-const CANDIDATE_LIMIT = 50;
-const MAX_GEMINI_CANDIDATES = 25;
-/** Cap full-table scan pages (1000 rows each) to avoid Edge Function timeouts. */
-const MAX_FULL_SCAN_PAGES = 8;
+const CANDIDATE_LIMIT = 40;
+const MAX_GEMINI_CANDIDATES = 18;
+const GEMINI_BODY_EXCERPT = 800;
 const EXACT_TITLE_SIMILARITY = 0.92;
 const MIN_TITLE_FOR_REVIEW = 0.22;
 
@@ -154,7 +153,19 @@ async function fetchExactTitleMatches(
   return ((data ?? []) as GithubIssue[]).map((c) => scoreIssue(target, c, "exact_title"));
 }
 
-async function fetchRpcCandidates(
+type RpcCandidateRow = GithubIssue & { relevance_score: number; title_similarity?: number };
+
+function mapRpcRows(target: GithubIssue, data: unknown, source: string): ScoredCandidate[] {
+  return ((data ?? []) as RpcCandidateRow[]).map((r) => ({
+    ...scoreIssue(target, r, source),
+    relevance_score: Number(r.relevance_score),
+    title_similarity: Number(
+      r.title_similarity ?? stringSimilarity(normalizeText(target.title), normalizeText(r.title)),
+    ),
+  }));
+}
+
+async function fetchRpcCandidatesByIssue(
   sb: ReturnType<typeof createClient>,
   target: GithubIssue,
   owner: string,
@@ -166,69 +177,26 @@ async function fetchRpcCandidates(
     p_issue_number: target.issue_number,
     p_limit: CANDIDATE_LIMIT,
   });
-
   if (error) return { rows: [], error: error.message };
-
-  const rows = ((data ?? []) as Array<GithubIssue & { relevance_score: number; title_similarity?: number }>).map(
-    (r) => ({
-      ...scoreIssue(target, r, "pg_trgm"),
-      relevance_score: Number(r.relevance_score),
-      title_similarity: Number(r.title_similarity ?? stringSimilarity(
-        normalizeText(target.title),
-        normalizeText(r.title),
-      )),
-    }),
-  );
-  return { rows, error: null };
+  return { rows: mapRpcRows(target, data, "pg_trgm"), error: null };
 }
 
-/** Paginate all issues when RPC unavailable (unordered .limit() missed copy-paste rows). */
-async function fetchAllIssuesScored(
+/** pg_trgm search from title/body (fork inline targets — no in-worker full table scan). */
+async function fetchRpcCandidatesByContent(
   sb: ReturnType<typeof createClient>,
   target: GithubIssue,
   owner: string,
   repo: string,
-  excludeSameIssueNumber: boolean,
-  maxPages: number = MAX_FULL_SCAN_PAGES,
-): Promise<ScoredCandidate[]> {
-  const pageSize = 1000;
-  const pool: GithubIssue[] = [];
-  let from = 0;
-  let page = 0;
-
-  while (page < maxPages) {
-    page++;
-    let q = sb
-      .from("github_issues")
-      .select("issue_number, title, body, state, labels, html_url, github_updated_at")
-      .eq("owner", owner)
-      .eq("repo", repo)
-      .order("issue_number", { ascending: true })
-      .range(from, from + pageSize - 1);
-    if (excludeSameIssueNumber) {
-      q = q.neq("issue_number", target.issue_number);
-    }
-    const { data, error } = await q;
-
-    if (error) throw new Error(error.message);
-    if (!data?.length) break;
-    pool.push(...(data as GithubIssue[]));
-    if (data.length < pageSize) break;
-    from += pageSize;
-  }
-
-  return attachScoresFromPool(target, pool);
-}
-
-function attachScoresFromPool(target: GithubIssue, pool: GithubIssue[]): ScoredCandidate[] {
-  return pool
-    .map((c) => scoreIssue(target, c, "full_scan"))
-    .filter((c) =>
-      c.title_similarity >= 0.12 ||
-      c.relevance_score >= 0.5
-    )
-    .sort((a, b) => b.title_similarity - a.title_similarity || b.relevance_score - a.relevance_score)
-    .slice(0, CANDIDATE_LIMIT);
+): Promise<{ rows: ScoredCandidate[]; error: string | null }> {
+  const { data, error } = await sb.rpc("find_duplicate_candidates_by_content", {
+    p_owner: owner,
+    p_repo: repo,
+    p_title: target.title,
+    p_body: target.body ?? "",
+    p_limit: CANDIDATE_LIMIT,
+  });
+  if (error) return { rows: [], error: error.message };
+  return { rows: mapRpcRows(target, data, "pg_trgm_content"), error: null };
 }
 
 async function fetchScoredCandidates(
@@ -242,29 +210,36 @@ async function fetchScoredCandidates(
   const exact = await fetchExactTitleMatches(sb, target, owner, repo, excludeSame);
 
   if (!targetFromDb) {
-    if (exact.length > 0) {
-      return {
-        rows: mergeCandidates(target, [exact], false).slice(0, CANDIDATE_LIMIT),
-        method: "exact_title",
-        rpc_error: null,
-      };
-    }
-    const scanned = await fetchAllIssuesScored(sb, target, owner, repo, false);
-    const merged = mergeCandidates(target, [exact, scanned], false);
-    return { rows: merged.slice(0, CANDIDATE_LIMIT), method: "exact_title+full_scan", rpc_error: null };
+    const { rows: contentRows, error: contentError } = await fetchRpcCandidatesByContent(
+      sb,
+      target,
+      owner,
+      repo,
+    );
+    const merged = mergeCandidates(target, [exact, contentRows], false);
+    const method = exact.length
+      ? (contentRows.length ? "exact_title+pg_trgm_content" : "exact_title")
+      : (contentRows.length ? "pg_trgm_content" : "none");
+    return { rows: merged.slice(0, CANDIDATE_LIMIT), method, rpc_error: contentError };
   }
 
-  const { rows: rpcRows, error: rpcError } = await fetchRpcCandidates(sb, target, owner, repo);
-
-  let method = rpcError ? "full_scan" : "pg_trgm";
+  const { rows: rpcRows, error: rpcError } = await fetchRpcCandidatesByIssue(sb, target, owner, repo);
   let merged = mergeCandidates(target, [exact, rpcRows], true);
+  let method = rpcError ? "pg_trgm_issue_failed" : "pg_trgm";
 
   if (rpcError || merged.length < 5) {
-    console.warn("supplementing candidates:", rpcError ?? "few rpc rows");
-    const scanned = await fetchAllIssuesScored(sb, target, owner, repo, true);
-    merged = mergeCandidates(target, [exact, rpcRows, scanned], true);
-    method = rpcError ? "full_scan+exact_title" : "pg_trgm+exact_title";
-    if (rpcError && exact.length === 0 && scanned.length > 0) method = "full_scan";
+    const { rows: contentRows, error: contentError } = await fetchRpcCandidatesByContent(
+      sb,
+      target,
+      owner,
+      repo,
+    );
+    merged = mergeCandidates(target, [exact, rpcRows, contentRows], true);
+    method = contentRows.length
+      ? (rpcError ? "pg_trgm_content+exact_title" : "pg_trgm+pg_trgm_content")
+      : method;
+    const err = [rpcError, contentError].filter(Boolean).join("; ") || null;
+    return { rows: merged.slice(0, CANDIDATE_LIMIT), method, rpc_error: err };
   }
 
   return { rows: merged.slice(0, CANDIDATE_LIMIT), method, rpc_error: rpcError };
@@ -326,7 +301,7 @@ ${candidates
   .map(
     (c) =>
       `#${c.issue_number} [${c.state}] title_sim=${c.title_similarity.toFixed(2)} ${c.title}\n` +
-      `Body excerpt:\n${(c.body ?? "").slice(0, 1200)}\n---`,
+      `Body excerpt:\n${(c.body ?? "").slice(0, GEMINI_BODY_EXCERPT)}\n---`,
   )
   .join("\n")}
 

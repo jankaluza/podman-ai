@@ -107,7 +107,7 @@ select issue_number, state, title from github_issues
 where owner='containers' and repo='podman' and title like '%Strict Dependency Enforcement%';
 ```
 
-Apply the migration and redeploy:
+Apply migrations and redeploy (required after `find_duplicate_candidates_by_content` — avoids HTTP 546 worker limits):
 
 ```bash
 supabase db push
